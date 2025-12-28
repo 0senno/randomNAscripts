@@ -1,92 +1,309 @@
 --!nocheck
---  Fast No-Limit Orb Farm  (drop-in upgrade)
+--  No-Limit Orb Farm v2 | Pxrson Upgraded
 --------------------------------------------------------------------
-local Players, WS, UIS = game:GetService("Players"), game:GetService("Workspace"), game:GetService("UserInputService")
-local Player = Players.LocalPlayer
-local camera = workspace.CurrentCamera
+local Services = {
+    Players = game:GetService("Players"),
+    Workspace = game:GetService("Workspace"),
+    StarterGui = game:GetService("StarterGui"),
+    UserInput = game:GetService("UserInputService"),
+    RunService = game:GetService("RunService")
+}
 
---------------------------------------------------------------------
--- UI stuff (unchanged, just localised)
---------------------------------------------------------------------
-local Services = {Players = Players, StarterGui = game:GetService("StarterGui")}
-local Stage, Running = 1, false
+local Player = Services.Players.LocalPlayer
+local Character, RootPart = nil, nil
 local MaxStage = 30
+local IsRunning = false
+local CurrentStage = 1
+local OrbCache = {}
+local FarmThread = nil
 
--- (all your UI creation code is identical – skipped here for brevity)
--- … copy the ScreenGui / Frame / Buttons exactly as you had them …
+-- Update character reference
+local function UpdateCharacter()
+    Character = Player.Character or Player.CharacterAdded:Wait()
+    RootPart = Character:WaitForChild("HumanoidRootPart", 3)
+end
+Player.CharacterAdded:Connect(UpdateCharacter)
+UpdateCharacter()
 
---------------------------------------------------------------------
--- Logic
---------------------------------------------------------------------
-local Boosts = WS:WaitForChild("Map"):WaitForChild("Stages"):WaitForChild("Boosts")
-local OrbCache = {} do -- map stage number → array of BasePart orbs
-    for s = 1, MaxStage do
-        OrbCache[s] = {}
-        local folder = Boosts:FindFirstChild(tostring(s))
+-- Cache orbs once (massive speedup)
+local function CacheOrbs()
+    local Boosts = Services.Workspace:WaitForChild("Map", 5):WaitForChild("Stages", 5):WaitForChild("Boosts", 5)
+    if not Boosts then return end
+    
+    for stage = 1, MaxStage do
+        OrbCache[stage] = {}
+        local folder = Boosts:FindFirstChild(tostring(stage))
         if folder then
             for _, model in ipairs(folder:GetChildren()) do
-                for _, v in ipairs(model:GetDescendants()) do
-                    if v:IsA("BasePart") then table.insert(OrbCache[s], v) end
+                for _, part in ipairs(model:GetDescendants()) do
+                    if part:IsA("BasePart") and part.Name:lower():match("orb") then
+                        table.insert(OrbCache[stage], part)
+                    end
                 end
             end
         end
     end
 end
+CacheOrbs()
 
-local function fastestTeleport(cf)
-    local root = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
-    if root then root.CFrame = cf end
-end
+--------------------------------------------------------------------
+-- UI Creation (fixed visibility)
+--------------------------------------------------------------------
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "OrbFarmUI"
+ScreenGui.Parent = game:GetService("CoreGui")
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Enabled = true -- FIX: Ensure it's actually visible
 
-local function collectStage()
-    local orbs = OrbCache[Stage]
-    if not orbs or #orbs == 0 then return end
-    -- Pick a single point in the air that touches every orb
-    local aggregate = Vector3.new()
-    for _, o in ipairs(orbs) do aggregate += o.Position end
-    local center = aggregate / #orbs + Vector3.new(0, 3, 0) -- 3 studs above
-    fastestTeleport(CFrame.new(center))
-    -- One frame is enough for .Touched to fire
-    task.wait(0.03)
-end
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.fromOffset(230, 140)
+MainFrame.Position = UDim2.fromScale(0.5, 0.5)
+MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+MainFrame.BackgroundColor3 = Color3.fromHex("#141414")
+MainFrame.BackgroundTransparency = 0.05
+MainFrame.Parent = ScreenGui
 
-local respawnTime = 7 -- most games respawn orbs after ~7 s; tweak if needed
-local farmThread = nil
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 8)
+UICorner.Parent = MainFrame
 
-ToggleButton.MouseButton1Click:Connect(function()
-    Running = not Running
-    if Running then
-        ToggleButton.Text = "Stop"
-        ToggleButton.BackgroundColor3 = Color3.fromRGB(170,0,0)
-        farmThread = task.spawn(function()
-            while Running do
-                collectStage()
-                task.wait(respawnTime) -- sleep until orbs come back
-            end
-        end)
-    else
-        ToggleButton.Text = "Start"
-        ToggleButton.BackgroundColor3 = Color3.fromRGB(0,170,0)
-        if farmThread then task.cancel(farmThread) end
+local TitleBar = Instance.new("Frame")
+TitleBar.Name = "TitleBar"
+TitleBar.Size = UDim2.new(1, 0, 0, 30)
+TitleBar.BackgroundColor3 = Color3.fromHex("#1a1a1a")
+TitleBar.Parent = MainFrame
+
+local TitleCorner = Instance.new("UICorner")
+TitleCorner.CornerRadius = UDim.new(0, 6)
+TitleCorner.Parent = TitleBar
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Text = "⚡ No-Limit Orb Farm v2"
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextSize = 13
+TitleLabel.TextColor3 = Color3.fromHex("#ffffff")
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Size = UDim2.new(1, -35, 1, 0)
+TitleLabel.Position = UDim2.fromOffset(8, 0)
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TitleBar
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.Text = "✕"
+CloseButton.Size = UDim2.fromOffset(25, 25)
+CloseButton.Position = UDim2.new(1, -27, 0.5, 0)
+CloseButton.AnchorPoint = Vector2.new(0, 0.5)
+CloseButton.Font = Enum.Font.GothamBold
+CloseButton.TextSize = 14
+CloseButton.TextColor3 = Color3.fromHex("#ff4444")
+CloseButton.BackgroundTransparency = 1
+CloseButton.Parent = TitleBar
+
+CloseButton.Activated:Connect(function()
+    ScreenGui:Destroy()
+    IsRunning = false
+    if FarmThread then task.cancel(FarmThread) end
+end)
+
+-- Dragging (improved)
+local Dragging, DragInput, DragStart, StartPos = false
+TitleBar.InputBegan:Connect(function(input)
+    if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        Dragging = true
+        DragStart = input.Position
+        StartPos = MainFrame.AbsolutePosition
     end
 end)
 
--- stage selector (unchanged)
-LeftButton.MouseButton1Click:Connect(function()
-    Stage = math.max(1, Stage - 1)
-    StageBox.Text = tostring(Stage)
-end)
-RightButton.MouseButton1Click:Connect(function()
-    Stage = math.min(MaxStage, Stage + 1)
-    StageBox.Text = tostring(Stage)
-end)
-StageBox.FocusLost:Connect(function()
-    local n = tonumber(StageBox.Text)
-    if n and n >= 1 and n <= MaxStage then Stage = n else StageBox.Text = tostring(Stage) end
+Services.UserInput.InputChanged:Connect(function(input)
+    if Dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local Delta = input.Position - DragStart
+        local viewport = Services.Workspace.CurrentCamera.ViewportSize
+        local newPos = Vector2.new(
+            math.clamp(StartPos.X + Delta.X, 0, viewport.X - MainFrame.AbsoluteSize.X),
+            math.clamp(StartPos.Y + Delta.Y, 0, viewport.Y - MainFrame.AbsoluteSize.Y)
+        )
+        MainFrame.Position = UDim2.fromOffset(newPos.X, newPos.Y)
+    end
 end)
 
-Services.StarterGui:SetCore("SendNotification",{
-    Title = "Tip",
-    Text = "teleport to your world, then input your stage",
+Services.UserInput.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        Dragging = false
+    end
+end)
+
+-- Stage selector
+local StageLabel = Instance.new("TextLabel")
+StageLabel.Text = "Stage:"
+StageLabel.Font = Enum.Font.Gotham
+StageLabel.TextSize = 13
+StageLabel.TextColor3 = Color3.fromHex("#ffffff")
+StageLabel.BackgroundTransparency = 1
+StageLabel.Size = UDim2.fromOffset(60, 20)
+StageLabel.Position = UDim2.fromOffset(10, 45)
+StageLabel.Parent = MainFrame
+
+local LeftButton = Instance.new("TextButton")
+LeftButton.Text = "<"
+LeftButton.Size = UDim2.fromOffset(28, 28)
+LeftButton.Position = UDim2.fromOffset(75, 41)
+LeftButton.BackgroundColor3 = Color3.fromHex("#1a1a1a")
+LeftButton.Font = Enum.Font.GothamBold
+LeftButton.TextSize = 14
+LeftButton.TextColor3 = Color3.fromHex("#ffffff")
+LeftButton.Parent = MainFrame
+
+local LeftCorner = Instance.new("UICorner")
+LeftCorner.CornerRadius = UDim.new(0, 4)
+LeftCorner.Parent = LeftButton
+
+local StageBox = Instance.new("TextBox")
+StageBox.Text = "1"
+StageBox.Size = UDim2.fromOffset(50, 28)
+StageBox.Position = UDim2.fromOffset(108, 41)
+StageBox.BackgroundColor3 = Color3.fromHex("#1a1a1a")
+StageBox.TextColor3 = Color3.fromHex("#ffffff")
+StageBox.Font = Enum.Font.Gotham
+StageBox.TextSize = 13
+StageBox.TextScaled = true
+StageBox.ClearTextOnFocus = false
+StageBox.Parent = MainFrame
+
+local BoxCorner = Instance.new("UICorner")
+BoxCorner.CornerRadius = UDim.new(0, 4)
+BoxCorner.Parent = StageBox
+
+local RightButton = Instance.new("TextButton")
+RightButton.Text = ">"
+RightButton.Size = UDim2.fromOffset(28, 28)
+RightButton.Position = UDim2.fromOffset(162, 41)
+RightButton.BackgroundColor3 = Color3.fromHex("#1a1a1a")
+RightButton.Font = Enum.Font.GothamBold
+RightButton.TextSize = 14
+RightButton.TextColor3 = Color3.fromHex("#ffffff")
+RightButton.Parent = MainFrame
+
+local RightCorner = Instance.new("UICorner")
+RightCorner.CornerRadius = UDim.new(0, 4)
+RightCorner.Parent = RightButton
+
+local ToggleButton = Instance.new("TextButton")
+ToggleButton.Name = "ToggleButton"
+ToggleButton.Text = "START FARMING"
+ToggleButton.Size = UDim2.fromOffset(210, 32)
+ToggleButton.Position = UDim2.fromOffset(10, 80)
+ToggleButton.BackgroundColor3 = Color3.fromHex("#00aa00")
+ToggleButton.Font = Enum.Font.GothamBold
+ToggleButton.TextSize = 13
+ToggleButton.TextColor3 = Color3.fromHex("#ffffff")
+ToggleButton.Parent = MainFrame
+
+local ToggleCorner = Instance.new("UICorner")
+ToggleCorner.CornerRadius = UDim.new(0, 5)
+ToggleCorner.Parent = ToggleButton
+
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Name = "StatusLabel"
+StatusLabel.Text = "Ready | Orbs: 0"
+StatusLabel.Size = UDim2.fromOffset(210, 15)
+StatusLabel.Position = UDim2.fromOffset(10, 118)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.TextSize = 11
+StatusLabel.TextColor3 = Color3.fromHex("#aaaaaa")
+StatusLabel.Parent = MainFrame
+
+--------------------------------------------------------------------
+-- Core Logic (blazing fast)
+--------------------------------------------------------------------
+local function CollectAllOrbs()
+    if not RootPart or not Character or not Character.Parent then return 0 end
+    
+    local orbs = OrbCache[CurrentStage]
+    if not orbs or #orbs == 0 then return 0 end
+    
+    -- Calculate bounding box center (touches all orbs)
+    local minPos, maxPos = Vector3.one * math.huge, Vector3.one * -math.huge
+    for _, orb in ipairs(orbs) do
+        if orb and orb.Parent then
+            local pos = orb.Position
+            minPos = Vector3.new(math.min(minPos.X, pos.X), math.min(minPos.Y, pos.Y), math.min(minPos.Z, pos.Z))
+            maxPos = Vector3.new(math.max(maxPos.X, pos.X), math.max(maxPos.Y, pos.Y), math.max(maxPos.Z, pos.Z))
+        end
+    end
+    
+    local center = (minPos + maxPos) / 2 + Vector3.new(0, 5, 0) -- 5 studs up
+    RootPart.CFrame = CFrame.new(center)
+    
+    -- Single wait for .Touched events to fire
+    task.wait(0.05)
+    return #orbs
+end
+
+local function FarmLoop()
+    while IsRunning do
+        local collected = CollectAllOrbs()
+        StatusLabel.Text = string.format("Stage %d | Collected: %d", CurrentStage, collected)
+        
+        -- Wait for respawn (adjust if needed)
+        for i = 1, 7 do
+            if not IsRunning then break end
+            StatusLabel.Text = string.format("Respawn in %ds...", 7 - i)
+            task.wait(1)
+        end
+    end
+    StatusLabel.Text = "Ready | Orbs: 0"
+end
+
+-- Stage controls
+StageBox.FocusLost:Connect(function()
+    local num = tonumber(StageBox.Text)
+    if num and num >= 1 and num <= MaxStage then
+        CurrentStage = math.floor(num)
+    end
+    StageBox.Text = tostring(CurrentStage)
+end)
+
+LeftButton.MouseButton1Click:Connect(function()
+    CurrentStage = math.max(1, CurrentStage - 1)
+    StageBox.Text = tostring(CurrentStage)
+end)
+
+RightButton.MouseButton1Click:Connect(function()
+    CurrentStage = math.min(MaxStage, CurrentStage + 1)
+    StageBox.Text = tostring(CurrentStage)
+end)
+
+-- Toggle farming
+ToggleButton.MouseButton1Click:Connect(function()
+    IsRunning = not IsRunning
+    if IsRunning then
+        ToggleButton.Text = "STOP FARMING"
+        ToggleButton.BackgroundColor3 = Color3.fromHex("#aa0000")
+        FarmThread = task.spawn(FarmLoop)
+    else
+        ToggleButton.Text = "START FARMING"
+        ToggleButton.BackgroundColor3 = Color3.fromHex("#00aa00")
+        if FarmThread then task.cancel(FarmThread) end
+    end
+end)
+
+-- Anti-AFK
+task.spawn(function()
+    while true do
+        if IsRunning then
+            local v = Vector3.new(math.random(), math.random(), math.random())
+            Services.Workspace:FindFirstChildOfClass("Camera").CFrame *= CFrame.new(v * 0.01)
+        end
+        task.wait(60)
+    end
+end)
+
+Services.StarterGui:SetCore("SendNotification", {
+    Title = "✅ Farm Loaded",
+    Text = "UI is ready. Select stage and click START.",
     Duration = 5
 })
