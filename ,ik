@@ -1,0 +1,669 @@
+local queueteleport = (syn and syn.queue_on_teleport) or queue_on_teleport or (fluxus and fluxus.queue_on_teleport) or queueonteleport
+if queueteleport then
+    pcall(function()
+        queueteleport([[
+            -- Auto-Executing QiReleaseFarm on Rejoin
+            loadstring(game:HttpGet("https://raw.githubusercontent.com/YourRepo/YourScript.lua"))()
+        ]])
+    end)
+end
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local FLIGHT_SPEED = 500
+local autoFarming = true
+local useFilter = true
+local useEasyOnly = false
+local useOneShot = true
+local useBossFarm = true
+local STRENGTH_MULTIPLIER = 3.0
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local rootPart = character:WaitForChild("HumanoidRootPart")
+
+local remoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
+local qiReleaseEvent = remoteEvents:WaitForChild("QiRelease")
+local attackEvent = remoteEvents:WaitForChild("Attack")
+local CollectionService = game:GetService("CollectionService")
+
+local enemiesFolder = workspace:FindFirstChild("Enemies")
+
+if not enemiesFolder then
+    warn("Enemies folder not found!")
+    return
+end
+
+local noclipConn = nil
+
+local function refreshCharacter()
+    character = player.Character or player.CharacterAdded:Wait()
+    rootPart  = character:WaitForChild("HumanoidRootPart")
+end
+
+local function enableNoclip()
+    if noclipConn then return end
+    noclipConn = RunService.Stepped:Connect(function()
+        if not character or not character.Parent then return end
+        for _, p in ipairs(character:GetDescendants()) do
+            if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then p.CanCollide = false end
+        end
+    end)
+end
+
+local function disableNoclip()
+    if noclipConn then
+        noclipConn:Disconnect()
+        noclipConn = nil
+    end
+    if not character or not character.Parent then return end
+    for _, p in ipairs(character:GetDescendants()) do
+        if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then p.CanCollide = true end
+    end
+end
+
+local function travelTo(targetCFrame)
+    refreshCharacter()
+
+    local targetPos = targetCFrame.Position
+    local startPos  = rootPart.Position
+    local dist      = (startPos - targetPos).Magnitude
+
+    if dist < 0.5 then
+        return function() end
+    end
+
+    enableNoclip()
+
+    local bv = rootPart:FindFirstChild("FlightBV") or Instance.new("BodyVelocity")
+    bv.Name = "FlightBV"
+    bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    bv.Velocity = Vector3.zero
+    bv.Parent = rootPart
+
+    local bg = rootPart:FindFirstChild("FlightBG") or Instance.new("BodyGyro")
+    bg.Name = "FlightBG"
+    bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    bg.P = 500000
+    bg.D = 500
+    bg.CFrame = rootPart.CFrame
+    bg.Parent = rootPart
+
+    local cleaned = false
+    local function cleanup()
+        if cleaned then return end
+        cleaned = true
+
+        if bv and bv.Parent then bv:Destroy() end
+        if bg and bg.Parent then bg:Destroy() end
+
+        pcall(function()
+            rootPart.AssemblyLinearVelocity = Vector3.zero
+            rootPart.AssemblyAngularVelocity = Vector3.zero
+        end)
+
+        disableNoclip()
+    end
+
+    local function moveTo(destPos, lookAtPos, threshold)
+        threshold = threshold or 2
+
+        local startVec = rootPart.Position
+        pcall(function()
+            rootPart.AssemblyLinearVelocity = Vector3.zero
+            rootPart.AssemblyAngularVelocity = Vector3.zero
+        end)
+
+        local legDist = (startVec - destPos).Magnitude
+        if legDist < 0.1 then return end
+
+        if legDist > 600 then
+            local segments = math.ceil(legDist / 600)
+            local stepVec = (destPos - startVec) / segments
+            for i = 1, segments do
+                local nodePos = startVec + (stepVec * i)
+                moveTo(nodePos, lookAtPos, threshold)
+            end
+            return
+        end
+
+        local dir = (lookAtPos - startVec)
+        local flatDir = Vector3.new(dir.X, 0, dir.Z)
+        if flatDir.Magnitude < 0.01 then
+            flatDir = rootPart.CFrame.LookVector
+        end
+
+        local goalRot = CFrame.lookAt(Vector3.zero, flatDir)
+        local startCFrame = CFrame.new(startVec) * goalRot
+        local endCFrame   = CFrame.new(destPos) * goalRot
+
+        bg.CFrame = endCFrame
+
+        local duration = legDist / math.max(FLIGHT_SPEED, 1)
+        local t0 = tick()
+
+        while tick() - t0 < duration do
+            if not rootPart or not rootPart.Parent then break end
+            local alpha = (tick() - t0) / duration
+            rootPart.CFrame = startCFrame:Lerp(endCFrame, alpha)
+
+            if (rootPart.Position - destPos).Magnitude <= threshold then
+                break
+            end
+
+            RunService.Heartbeat:Wait()
+        end
+
+        rootPart.CFrame = endCFrame
+
+        if legDist > 300 then
+            task.wait(0.2)
+        end
+    end
+
+    local startVec = rootPart.Position
+    if dist < 25 then
+        moveTo(targetPos, targetPos)
+    else
+        local safeY = math.max(startVec.Y, targetPos.Y) + 40
+        local p1 = Vector3.new(startVec.X, safeY, startVec.Z)
+        local p2 = Vector3.new(targetPos.X, safeY, targetPos.Z)
+        moveTo(p1, p2)
+        moveTo(p2, p2)
+        moveTo(targetPos, targetPos)
+    end
+
+    return cleanup
+end
+
+local function getDangerLevel(enemyModel)
+    local myState = character and character:FindFirstChild("State")
+    local myRankVal = myState and myState:FindFirstChild("QiRank")
+    local myRank = myRankVal and myRankVal.Value
+    
+    local eState = enemyModel:FindFirstChild("State")
+    local eRankVal = eState and eState:FindFirstChild("QiRank")
+    local eRank = eRankVal and eRankVal.Value
+    
+    if myRank and eRank then
+        return eRank - myRank
+    end
+    
+    local myH = character and character:FindFirstChildOfClass("Humanoid")
+    local eH = enemyModel:FindFirstChildOfClass("Humanoid")
+    local mh = myH and myH.MaxHealth or 100
+    local eh = eH and eH.MaxHealth or 100
+    
+    if mh > 0 then
+        return (eh - mh) / mh
+    end
+    
+    return 0
+end
+
+local function isTargetOneShot(enemyModel)
+    local danger = getDangerLevel(enemyModel)
+    local myH = character and character:FindFirstChildOfClass("Humanoid")
+    local eH = enemyModel:FindFirstChildOfClass("Humanoid")
+    local mh = myH and myH.MaxHealth or 100
+    local eh = eH and eH.MaxHealth or 100
+    
+    return danger < 0 and eh <= (mh * 0.5)
+end
+
+local function getAliveEnemies()
+    local list = {}
+    for _, obj in ipairs(enemiesFolder:GetDescendants()) do
+        if obj:IsA("Model") then
+            local danger = getDangerLevel(obj)
+            if useFilter and danger >= 1.5 then continue end
+            if useEasyOnly and danger >= 0.0 then continue end
+            if useOneShot and not isTargetOneShot(obj) then continue end
+            
+            local humanoid = obj:FindFirstChildOfClass("Humanoid")
+            local ePart = obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildWhichIsA("BasePart")
+            if humanoid and humanoid.Health > 0 and ePart then
+                table.insert(list, {model = obj, part = ePart})
+            end
+        end
+    end
+    return list
+end
+
+print("Starting Flight-based Auto-QiRelease Farm...")
+
+local function startFarm()
+    task.spawn(function()
+        while autoFarming do
+            refreshCharacter()
+
+            local targets = getAliveEnemies()
+            if #targets == 0 then
+                task.wait(1)
+                continue
+            end
+
+            -- Priority 1: Check for alive Bosses if toggle is ON
+            local bossTargets = {}
+            if useBossFarm then
+                for _, info in ipairs(targets) do
+                    if CollectionService:HasTag(info.model, "Boss") then
+                        table.insert(bossTargets, info)
+                    end
+                end
+            end
+
+            -- Choose the array of targets to focus on
+            local activeTargets = (#bossTargets > 0) and bossTargets or targets
+
+            table.sort(activeTargets, function(a, b)
+                return (a.part.Position - rootPart.Position).Magnitude < (b.part.Position - rootPart.Position).Magnitude
+            end)
+
+            for _, eInfo in ipairs(activeTargets) do
+                if not autoFarming then break end
+                
+                local ePart = eInfo.part
+                if not ePart or not ePart.Parent then continue end
+                local eHum = ePart.Parent:FindFirstChildOfClass("Humanoid")
+                if eHum and eHum.Health <= 0 then continue end
+                
+                local isLocalBoss = CollectionService:HasTag(eInfo.model, "Boss")
+                
+                -- Teleport/Fly directly behind the enemy (4 studs behind their back)
+                local backCFrame = ePart.CFrame * CFrame.new(0, 0, 4)
+                
+                -- We want the player to face the enemy when we arrive
+                local finishFlight = travelTo(CFrame.lookAt(backCFrame.Position, ePart.Position))
+
+                if not ePart.Parent or (eHum and eHum.Health <= 0) then 
+                    if finishFlight then finishFlight() end
+                    continue 
+                end
+
+                if isLocalBoss and useBossFarm then
+                    -- Boss attack logic (Light melee spam)
+                    local args = {
+                        "Light",
+                        {
+                            RootPart = rootPart
+                        }
+                    }
+                    
+                    -- Stay locked onto this boss until it dies
+                    while autoFarming and ePart.Parent and eHum and eHum.Health > 0 do
+                        -- Keep glued to the boss's back even if it moves
+                        local dynamicBackCFrame = ePart.CFrame * CFrame.new(0, 0, 4)
+                        rootPart.CFrame = CFrame.lookAt(dynamicBackCFrame.Position, ePart.Position)
+                        rootPart.AssemblyLinearVelocity = Vector3.zero
+                        rootPart.AssemblyAngularVelocity = Vector3.zero
+                        
+                        pcall(function() attackEvent:FireServer(unpack(args)) end)
+                        task.wait(0.15)
+                    end
+                    
+                    if finishFlight then
+                        finishFlight()
+                    end
+                    -- Break out to force a rescan, guaranteeing we finish bosses one at a time
+                    break
+                else
+                    -- Standard QiRelease logic + 3-hit combo
+                    pcall(function() qiReleaseEvent:FireServer() end)
+                    pcall(function() qiReleaseEvent:FireServer(ePart.Position) end)
+                    
+                    local args = {
+                        "Light",
+                        {
+                            RootPart = rootPart
+                        }
+                    }
+                    for i = 1, 3 do
+                        pcall(function() attackEvent:FireServer(unpack(args)) end)
+                        task.wait(0.05)
+                    end
+                end
+                
+                if finishFlight then
+                    finishFlight()
+                end
+            end
+            task.wait(0.2)
+        end
+    end)
+end
+
+-- ==========================================
+-- GUI CREATION
+-- ==========================================
+local sg = Instance.new("ScreenGui")
+sg.Name = "QiReleaseGUI"
+sg.ResetOnSpawn = false
+
+local success = pcall(function() sg.Parent = gethui() end)
+if not success then
+    pcall(function() sg.Parent = game:GetService("CoreGui") end)
+end
+if not sg.Parent then
+    sg.Parent = player:WaitForChild("PlayerGui")
+end
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 200, 0, 235)
+mainFrame.Position = UDim2.new(0, 20, 0, 150)
+mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+mainFrame.BorderSizePixel = 0
+mainFrame.Parent = sg
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = mainFrame
+
+local title = Instance.new("TextLabel")
+title.Text = "💨 QiRelease Farm"
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundColor3 = Color3.fromRGB(150, 40, 200)
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.Parent = mainFrame
+
+local tCorner = Instance.new("UICorner")
+tCorner.CornerRadius = UDim.new(0, 8)
+tCorner.Parent = title
+local fixBottom = Instance.new("Frame")
+fixBottom.Size = UDim2.new(1, 0, 0, 8)
+fixBottom.Position = UDim2.new(0, 0, 1, -8)
+fixBottom.BackgroundColor3 = Color3.fromRGB(150, 40, 200)
+fixBottom.BorderSizePixel = 0
+fixBottom.Parent = title
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Text = "▶ Start Auto-Farm"
+toggleBtn.Size = UDim2.new(1, -20, 0, 30)
+toggleBtn.Position = UDim2.new(0, 10, 0, 40)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 13
+toggleBtn.Parent = mainFrame
+
+local speedLabel = Instance.new("TextLabel")
+speedLabel.Text = "Flight Speed: " .. FLIGHT_SPEED
+speedLabel.Size = UDim2.new(0.5, 0, 0, 20)
+speedLabel.Position = UDim2.new(0, 10, 0, 200)
+speedLabel.BackgroundTransparency = 1
+speedLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+speedLabel.Font = Enum.Font.Gotham
+speedLabel.TextSize = 12
+speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+speedLabel.Parent = mainFrame
+
+local speedInput = Instance.new("TextBox")
+speedInput.Text = tostring(FLIGHT_SPEED)
+speedInput.Size = UDim2.new(0.5, -20, 0, 20)
+speedInput.Position = UDim2.new(0.5, 0, 0, 200)
+speedInput.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+speedInput.TextColor3 = Color3.fromRGB(150, 40, 200)
+speedInput.Font = Enum.Font.Code
+speedInput.TextSize = 12
+speedInput.ClearTextOnFocus = false
+speedInput.Parent = mainFrame
+
+local filterBtnBase = Instance.new("Frame")
+filterBtnBase.Size = UDim2.new(1, -20, 0, 110)
+filterBtnBase.Position = UDim2.new(0, 10, 0, 75)
+filterBtnBase.BackgroundTransparency = 1
+filterBtnBase.Parent = mainFrame
+
+local filterLayout = Instance.new("UIListLayout")
+filterLayout.Padding = UDim.new(0, 5)
+filterLayout.FillDirection = Enum.FillDirection.Vertical
+filterLayout.Parent = filterBtnBase
+
+local filterBtn = Instance.new("TextButton")
+filterBtn.Text = "🛡 Filter Strong: ON"
+filterBtn.Size = UDim2.new(1, 0, 0, 25)
+filterBtn.BackgroundColor3 = Color3.fromRGB(40, 100, 160)
+filterBtn.TextColor3 = Color3.new(1, 1, 1)
+filterBtn.Font = Enum.Font.GothamBold
+filterBtn.TextSize = 12
+filterBtn.Parent = filterBtnBase
+
+local fbCorner = Instance.new("UICorner")
+fbCorner.CornerRadius = UDim.new(0, 6)
+fbCorner.Parent = filterBtn
+
+filterBtn.MouseButton1Click:Connect(function()
+    useFilter = not useFilter
+    if useFilter then
+        filterBtn.Text = "🛡 Filter Strong: ON"
+        filterBtn.BackgroundColor3 = Color3.fromRGB(40, 100, 160)
+    else
+        filterBtn.Text = "⚠ Filter Strong: OFF"
+        filterBtn.BackgroundColor3 = Color3.fromRGB(160, 60, 60)
+    end
+end)
+
+local easyBtn = Instance.new("TextButton")
+easyBtn.Text = "🟢 Easy Weak Only: OFF"
+easyBtn.Size = UDim2.new(1, 0, 0, 25)
+easyBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+easyBtn.TextColor3 = Color3.new(1, 1, 1)
+easyBtn.Font = Enum.Font.GothamBold
+easyBtn.TextSize = 12
+easyBtn.Parent = filterBtnBase
+
+local ebCorner = Instance.new("UICorner")
+ebCorner.CornerRadius = UDim.new(0, 6)
+ebCorner.Parent = easyBtn
+
+easyBtn.MouseButton1Click:Connect(function()
+    useEasyOnly = not useEasyOnly
+    if useEasyOnly then
+        easyBtn.Text = "🟢 Easy Weak Only: ON"
+        easyBtn.BackgroundColor3 = Color3.fromRGB(40, 160, 60)
+    else
+        easyBtn.Text = "🟢 Easy Weak Only: OFF"
+        easyBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    end
+end)
+
+local bossBtn = Instance.new("TextButton")
+bossBtn.Text = "💀 Auto Bosses: OFF"
+bossBtn.Size = UDim2.new(1, 0, 0, 25)
+bossBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 200)
+bossBtn.TextColor3 = Color3.new(1, 1, 1)
+bossBtn.Font = Enum.Font.GothamBold
+bossBtn.TextSize = 12
+bossBtn.Parent = filterBtnBase
+
+local bbCorner = Instance.new("UICorner")
+bbCorner.CornerRadius = UDim.new(0, 6)
+bbCorner.Parent = bossBtn
+
+bossBtn.MouseButton1Click:Connect(function()
+    useBossFarm = not useBossFarm
+    if useBossFarm then
+        bossBtn.Text = "💀 Auto Bosses: ON"
+        bossBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 200)
+    else
+        bossBtn.Text = "💀 Auto Bosses: OFF"
+        bossBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 200)
+    end
+end)
+
+local oneShotBtn = Instance.new("TextButton")
+oneShotBtn.Text = "💥 One-Shot Only: OFF"
+oneShotBtn.Size = UDim2.new(1, 0, 0, 25)
+oneShotBtn.BackgroundColor3 = Color3.fromRGB(160, 120, 30)
+oneShotBtn.TextColor3 = Color3.new(1, 1, 1)
+oneShotBtn.Font = Enum.Font.GothamBold
+oneShotBtn.TextSize = 12
+oneShotBtn.Parent = filterBtnBase
+
+local osCorner = Instance.new("UICorner")
+osCorner.CornerRadius = UDim.new(0, 6)
+osCorner.Parent = oneShotBtn
+
+oneShotBtn.MouseButton1Click:Connect(function()
+    useOneShot = not useOneShot
+    if useOneShot then
+        oneShotBtn.Text = "💥 One-Shot Only: ON"
+        oneShotBtn.BackgroundColor3 = Color3.fromRGB(160, 120, 30)
+    else
+        oneShotBtn.Text = "💥 One-Shot Only: OFF"
+        oneShotBtn.BackgroundColor3 = Color3.fromRGB(160, 120, 30)
+    end
+end)
+
+local inCorner = Instance.new("UICorner")
+inCorner.CornerRadius = UDim.new(0, 4)
+inCorner.Parent = speedInput
+
+-- Drag logic
+local dragging, dragStart, startPos
+title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = mainFrame.Position
+    end
+end)
+title.InputChanged:Connect(function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+        mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+title.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+
+-- Toggle logic
+toggleBtn.MouseButton1Click:Connect(function()
+    autoFarming = not autoFarming
+    if autoFarming then
+        toggleBtn.Text = "⏹ Stop Farm"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+        startFarm()
+    else
+        toggleBtn.Text = "▶ Start Auto-Farm"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    end
+end)
+
+-- Speed logic
+speedInput.FocusLost:Connect(function()
+    local val = tonumber(speedInput.Text)
+    if val then
+        FLIGHT_SPEED = math.clamp(val, 100, 2000)
+    end
+    speedInput.Text = tostring(FLIGHT_SPEED)
+    speedLabel.Text = "Flight Speed: " .. FLIGHT_SPEED
+end)
+
+-- Anti-AFK Script
+wait(0.5)
+local ba = Instance.new("ScreenGui")
+local ca = Instance.new("TextLabel")
+local da = Instance.new("Frame")
+local _b = Instance.new("TextLabel")
+local ab = Instance.new("TextLabel")
+
+local success_anti_afk = pcall(function() ba.Parent = gethui() end)
+if not success_anti_afk then
+    pcall(function() ba.Parent = game:GetService("CoreGui") end)
+end
+if not ba.Parent then
+    ba.Parent = player:WaitForChild("PlayerGui")
+end
+
+ba.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ca.Parent = ba
+ca.Active = true
+ca.BackgroundColor3 = Color3.new(0.176471, 0.176471, 0.176471)
+ca.Draggable = true
+ca.Position = UDim2.new(0.698610067, 0, 0.098096624, 0)
+ca.Size = UDim2.new(0, 370, 0, 52)
+ca.Font = Enum.Font.SourceSansSemibold
+ca.Text = "Anti Afk"
+ca.TextColor3 = Color3.new(0, 1, 1)
+ca.TextSize = 22
+
+da.Parent = ca
+da.BackgroundColor3 = Color3.new(0.196078, 0.196078, 0.196078)
+da.Position = UDim2.new(0, 0, 1.0192306, 0)
+da.Size = UDim2.new(0, 370, 0, 107)
+
+_b.Parent = da
+_b.BackgroundColor3 = Color3.new(0.176471, 0.176471, 0.176471)
+_b.Position = UDim2.new(0, 0, 0.800455689, 0)
+_b.Size = UDim2.new(0, 370, 0, 21)
+_b.Font = Enum.Font.Arial
+_b.Text = "Made by luca#5432"
+_b.TextColor3 = Color3.new(0, 1, 1)
+_b.TextSize = 20
+
+ab.Parent = da
+ab.BackgroundColor3 = Color3.new(0.176471, 0.176471, 0.176471)
+ab.Position = UDim2.new(0, 0, 0.158377, 0)
+ab.Size = UDim2.new(0, 370, 0, 44)
+ab.Font = Enum.Font.ArialBold
+ab.Text = "Status: Active"
+ab.TextColor3 = Color3.new(0, 1, 1)
+ab.TextSize = 20
+
+local bb = game:GetService("VirtualUser")
+game:GetService("Players").LocalPlayer.Idled:Connect(function()
+    bb:CaptureController()
+    bb:ClickButton2(Vector2.new())
+    ab.Text = "Roblox tried kicking you buy I didnt let them!"
+    wait(2)
+    ab.Text = "Status : Active"
+end)
+
+-- Auto Reconnect (Infinite Yield Rejoin Logic)
+local gs = game:GetService('GuiService')
+local reconnectDisabledList = {
+	-- [Enum.ConnectionError.DisconnectLuaKick] = true, -- REMOVED to bypass Error 267 (Kicks)
+	[Enum.ConnectionError.DisconnectSecurityKeyMismatch] = true,
+	[Enum.ConnectionError.DisconnectNewSecurityKeyMismatch] = true,
+	[Enum.ConnectionError.DisconnectDuplicateTicket] = true,
+	[Enum.ConnectionError.DisconnectWrongVersion] = true,
+	[Enum.ConnectionError.DisconnectProtocolMismatch] = true,
+	[Enum.ConnectionError.DisconnectBadhash] = true,
+	[Enum.ConnectionError.DisconnectIllegalTeleport] = true,
+	[Enum.ConnectionError.DisconnectDuplicatePlayer] = true,
+	[Enum.ConnectionError.DisconnectCloudEditKick] = true,
+	[Enum.ConnectionError.DisconnectOnRemoteSysStats] = true,
+	[Enum.ConnectionError.DisconnectRaknetErrors] = true,
+	[Enum.ConnectionError.PlacelaunchFlooded] = true,
+	[Enum.ConnectionError.PlacelaunchHashException] = true,
+	[Enum.ConnectionError.PlacelaunchHashExpired] = true,
+	[Enum.ConnectionError.PlacelaunchUnauthorized] = true,
+	[Enum.ConnectionError.PlacelaunchUserLeft] = true,
+	[Enum.ConnectionError.PlacelaunchRestricted] = true,
+}
+
+gs.ErrorMessageChanged:Connect(function()
+	local error_code = gs:GetErrorCode()
+	local error_type = gs:GetErrorType()
+	
+	if error_type == Enum.ConnectionError.DisconnectErrors and not reconnectDisabledList[error_code] then
+		print('Disconnect registered! Attempting to rejoin...')
+		while task.wait(5) do
+            local success, err = pcall(function()
+                game:GetService('TeleportService'):Teleport(game.PlaceId)
+            end)
+            if not success then
+                print("Teleport failed, retrying... " .. tostring(err))
+            end
+		end
+	end
+end)
+
+if autoFarming then startFarm() end
